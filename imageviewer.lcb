@@ -1,0 +1,406 @@
+/*
+Copyright (C) 2026 Emily-Elizabeth Howard
+
+ImageViewer Widget for HyperXTalk
+A full-size image viewer widget with zoom, pan, and imageRotation support.
+*/
+
+/**
+A widget that displays a single image with zoom, pan, and imageRotation.
+
+The image is centred in the widget. The user can zoom with the scroll
+wheel, pan by clicking and dragging, and rotate in 90-degree steps via
+the imageRotation property. All transforms are applied in the paint cycle;
+the underlying binary data is never modified.
+
+Name: imageViewerZoomChanged
+Type: message
+Syntax: imageViewerZoomChanged <pZoom>
+Summary: Sent when the zoom level changes.
+Description:
+pZoom is the new zoom level as a Real (1.0 = 100%). Sent after scroll-
+wheel zooms and after any programmatic zoom change. Use this to update
+a zoom percentage label in the host stack.
+
+Example:
+   on imageViewerZoomChanged pZoom
+      put round(pZoom * 100) & "%" into field "zoom"
+   end imageViewerZoomChanged
+*/
+
+widget com.hyperxtalk.widget.imageviewer
+
+metadata version is "1.0.0"
+metadata title is "Image Viewer"
+metadata author is "Emily-Elizabeth Howard"
+metadata svgicon is "M -11,-9 h 16 v 14 h -16 z M 7,7 l 5,5 M 7,3 a 4,4 0 1,0 -8,0 a 4,4 0 1,0 8,0"
+
+use com.livecode.widget
+use com.livecode.canvas
+use com.livecode.math
+use com.livecode.engine
+
+-- ── Properties ───────────────────────────────────────────────────────────────
+
+/**
+Summary: The image displayed in the viewer.
+Syntax:
+set the viewerImage of <widget> to <pData>
+get the viewerImage of <widget>
+Value (data): Binary image data (JPEG, PNG, etc.), or empty to clear.
+Description:
+Setting viewerImage decodes the image, resets zoom to fit the widget
+bounds, resets pan to centre, and resets imageRotation to 0. Reading the
+property returns the original raw binary data, suitable for export.
+
+Example:
+   on imageGridDoubleClicked pIndex
+      set the viewerImage of widget "imageViewer" to \
+         the selectedImageData of widget "imageGrid"
+   end imageGridDoubleClicked
+*/
+property viewerImage   get mImageData  set setImageData
+
+/**
+Summary: The current zoom level.
+Syntax:
+set the zoomLevel of <widget> to <pZoom>
+get the zoomLevel of <widget>
+Value (real): Zoom factor. 1.0 = 100%. Clamped to 0.05 – 32.0.
+Description:
+Set to zoom to an exact level. Use fitToWindow, actualSize, zoomIn,
+and zoomOut for common operations. Each change sends
+imageViewerZoomChanged.
+
+Example:
+   set the zoomLevel of widget "imageViewer" to 2.0
+*/
+property zoomLevel   get mZoomLevel  set setZoomLevel
+
+/**
+Summary: The imageRotation of the displayed image in degrees.
+Syntax:
+set the imageRotation of <widget> to <pDegrees>
+get the imageRotation of <widget>
+Value (integer): 0, 90, 180, or 270. Other values snap to the nearest
+multiple of 90.
+Description:
+Rotation is applied visually during paint; the underlying image data is
+not modified. To rotate 90 degrees clockwise from the toolbar:
+
+   set the imageRotation of widget "imageViewer" to \
+      (the imageRotation of widget "imageViewer" + 90) mod 360
+
+Example:
+   set the imageRotation of widget "imageViewer" to 90
+*/
+property imageRotation    get mRotation   set setRotation
+
+/**
+Summary: Fits the image to the widget bounds.
+Syntax: set the fitToWindow of <widget> to true
+Value (boolean): Pass true to trigger. Passing false has no effect.
+Description:
+Scales the image to fit entirely within the widget, centred, with pan
+reset. Sends imageViewerZoomChanged with the new zoom level.
+
+Example:
+   set the fitToWindow of widget "imageViewer" to true
+*/
+property fitToWindow get mDummyBool  set setFitToWindow
+
+/**
+Summary: Zooms to 100% (one image pixel per screen point).
+Syntax: set the actualSize of <widget> to true
+Value (boolean): Pass true to trigger. Passing false has no effect.
+Description:
+Sets zoom to 1.0 and resets pan to centre.
+
+Example:
+   set the actualSize of widget "imageViewer" to true
+*/
+property actualSize  get mDummyBool2 set setActualSize
+
+/**
+Summary: Zooms in by one step (~25%).
+Syntax: set the zoomIn of <widget> to true
+Value (boolean): Pass true to trigger. Passing false has no effect.
+Description:
+Multiplies the current zoom by 1.25, clamped to the maximum zoom.
+
+Example:
+   set the zoomIn of widget "imageViewer" to true
+*/
+property zoomIn      get mDummyBool3 set setZoomIn
+
+/**
+Summary: Zooms out by one step (~25%).
+Syntax: set the zoomOut of <widget> to true
+Value (boolean): Pass true to trigger. Passing false has no effect.
+Description:
+Divides the current zoom by 1.25, clamped to the minimum zoom.
+
+Example:
+   set the zoomOut of widget "imageViewer" to true
+*/
+property zoomOut     get mDummyBool4 set setZoomOut
+
+-- ── Private state ────────────────────────────────────────────────────────────
+
+private variable mImageData   as Data           -- raw binary; empty = no image
+private variable mImage       as optional Image -- decoded; nothing = no image
+private variable mZoomLevel   as Real           -- 1.0 = 100%
+private variable mRotation    as Integer        -- 0, 90, 180, or 270
+private variable mPanX        as Real           -- pan offset from centre (points)
+private variable mPanY        as Real
+private variable mIsPanning   as Boolean
+private variable mPanStartX   as Real
+private variable mPanStartY   as Real
+private variable mPanOffsetStartX as Real
+private variable mPanOffsetStartY as Real
+private variable mBackColor   as Color
+
+-- Dummy backing variables for write-only / trigger properties
+private variable mDummyBool   as Boolean
+private variable mDummyBool2  as Boolean
+private variable mDummyBool3  as Boolean
+private variable mDummyBool4  as Boolean
+
+-- ── Constants ────────────────────────────────────────────────────────────────
+
+constant kMinZoom  is 0.05
+constant kMaxZoom  is 32.0
+constant kZoomStep is 1.25
+
+-- ── Lifecycle ────────────────────────────────────────────────────────────────
+
+private handler initDefaults()
+   put the empty data into mImageData
+   put nothing into mImage
+   put 1.0 into mZoomLevel
+   put 0 into mRotation
+   put 0.0 into mPanX
+   put 0.0 into mPanY
+   put false into mIsPanning
+   put 0.0 into mPanStartX
+   put 0.0 into mPanStartY
+   put 0.0 into mPanOffsetStartX
+   put 0.0 into mPanOffsetStartY
+   put color [0.1, 0.1, 0.1] into mBackColor
+   put false into mDummyBool
+   put false into mDummyBool2
+   put false into mDummyBool3
+   put false into mDummyBool4
+end handler
+
+public handler OnCreate()
+   initDefaults()
+end handler
+
+public handler OnSave(out rProperties as Array)
+   -- The viewer is transient; image data is managed by the host stack.
+   put the empty array into rProperties
+end handler
+
+public handler OnLoad(in pProperties as Array)
+   initDefaults()
+end handler
+
+-- ── Paint ────────────────────────────────────────────────────────────────────
+
+public handler OnPaint()
+   -- Background
+   set the paint of this canvas to solid paint with mBackColor
+   fill rectangle path of my bounds on this canvas
+
+   if mImage is nothing then
+      set the font of this canvas to font "system" at size 14
+      set the paint of this canvas to solid paint with color [0.45, 0.45, 0.45]
+      fill text "No image" at center of my bounds on this canvas
+      return
+   end if
+
+   variable tImgW as Real
+   variable tImgH as Real
+   put the width  of mImage into tImgW
+   put the height of mImage into tImgH
+
+   -- Centre of the widget, shifted by pan
+   variable tCX as Real
+   variable tCY as Real
+   put my width  / 2 + mPanX into tCX
+   put my height / 2 + mPanY into tCY
+
+   save state of this canvas
+
+   -- Translate origin to image centre, apply imageRotation then zoom, draw at origin.
+   translate this canvas by [tCX, tCY]
+   rotate this canvas by mRotation
+   scale this canvas by [mZoomLevel, mZoomLevel]
+   draw mImage into rectangle [-tImgW / 2, -tImgH / 2, tImgW / 2, tImgH / 2] of this canvas
+
+   restore state of this canvas
+end handler
+
+-- ── Input ────────────────────────────────────────────────────────────────────
+
+-- Scroll wheel zooms.
+public handler OnMouseScroll(in pDeltaX as Real, in pDeltaY as Real)
+   if pDeltaY > 0 then
+      applyZoom(mZoomLevel * kZoomStep)
+   else if pDeltaY < 0 then
+      applyZoom(mZoomLevel / kZoomStep)
+   end if
+end handler
+
+-- Click and drag pans the image.
+public handler OnMouseDown() returns nothing
+   put true into mIsPanning
+   put the x of the mouse position into mPanStartX
+   put the y of the mouse position into mPanStartY
+   put mPanX into mPanOffsetStartX
+   put mPanY into mPanOffsetStartY
+end handler
+
+public handler OnMouseMove() returns nothing
+   if not mIsPanning then
+      return
+   end if
+   put mPanOffsetStartX + (the x of the mouse position - mPanStartX) into mPanX
+   put mPanOffsetStartY + (the y of the mouse position - mPanStartY) into mPanY
+   redraw all
+end handler
+
+public handler OnMouseUp() returns nothing
+   put false into mIsPanning
+end handler
+
+public handler OnGeometryChanged()
+   redraw all
+end handler
+
+-- ── Property handlers ────────────────────────────────────────────────────────
+
+public handler setImageData(in pData as Data)
+   put pData into mImageData
+   if pData is empty then
+      put nothing into mImage
+   else
+      put image from data pData into mImage
+   end if
+   put 0.0 into mPanX
+   put 0.0 into mPanY
+   put 0 into mRotation
+   fitZoom()
+   redraw all
+end handler
+
+public handler setZoomLevel(in pZoom as Real)
+   applyZoom(pZoom)
+end handler
+
+public handler setRotation(in pDegrees as Integer)
+   variable tRot as Integer
+   put pDegrees mod 360 into tRot
+   if tRot < 0 then
+      add 360 to tRot
+   end if
+   -- Snap to nearest multiple of 90
+   if tRot < 45 then
+      put 0 into mRotation
+   else if tRot < 135 then
+      put 90 into mRotation
+   else if tRot < 225 then
+      put 180 into mRotation
+   else if tRot < 315 then
+      put 270 into mRotation
+   else
+      put 0 into mRotation
+   end if
+   redraw all
+end handler
+
+public handler setFitToWindow(in pTrigger as Boolean)
+   if pTrigger then
+      put 0.0 into mPanX
+      put 0.0 into mPanY
+      fitZoom()
+      redraw all
+   end if
+end handler
+
+public handler setActualSize(in pTrigger as Boolean)
+   if pTrigger then
+      put 1.0 into mZoomLevel
+      put 0.0 into mPanX
+      put 0.0 into mPanY
+      redraw all
+      post "imageViewerZoomChanged" with [mZoomLevel]
+   end if
+end handler
+
+public handler setZoomIn(in pTrigger as Boolean)
+   if pTrigger then
+      applyZoom(mZoomLevel * kZoomStep)
+   end if
+end handler
+
+public handler setZoomOut(in pTrigger as Boolean)
+   if pTrigger then
+      applyZoom(mZoomLevel / kZoomStep)
+   end if
+end handler
+
+-- ── Private helpers ──────────────────────────────────────────────────────────
+
+-- Clamp and apply a new zoom level, then notify.
+private handler applyZoom(in pZoom as Real)
+   if pZoom < kMinZoom then
+      put kMinZoom into mZoomLevel
+   else if pZoom > kMaxZoom then
+      put kMaxZoom into mZoomLevel
+   else
+      put pZoom into mZoomLevel
+   end if
+   redraw all
+   post "imageViewerZoomChanged" with [mZoomLevel]
+end handler
+
+-- Scale to fit the image within the widget bounds, preserving aspect ratio.
+private handler fitZoom()
+   if mImage is nothing then
+      return
+   end if
+
+   variable tImgW as Real
+   variable tImgH as Real
+   put the width  of mImage into tImgW
+   put the height of mImage into tImgH
+
+   -- Swap dimensions for 90 / 270 imageRotation
+   if mRotation is 90 or mRotation is 270 then
+      variable tTemp as Real
+      put tImgW into tTemp
+      put tImgH into tImgW
+      put tTemp into tImgH
+   end if
+
+   if tImgW <= 0 or tImgH <= 0 then
+      return
+   end if
+
+   variable tScaleX as Real
+   variable tScaleY as Real
+   put my width  / tImgW into tScaleX
+   put my height / tImgH into tScaleY
+
+   if tScaleX < tScaleY then
+      put tScaleX into mZoomLevel
+   else
+      put tScaleY into mZoomLevel
+   end if
+
+   post "imageViewerZoomChanged" with [mZoomLevel]
+end handler
+
+end widget
